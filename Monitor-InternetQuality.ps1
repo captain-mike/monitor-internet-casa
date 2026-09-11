@@ -368,6 +368,44 @@ function Get-EventClassification {
     return 'Unknown'
 }
 
+function Get-ProvisionalClassification {
+    param(
+        [Parameter(Mandatory)][object[]]$ProblemRows,
+        [AllowNull()][string]$GatewayTarget,
+        [Parameter(Mandatory)]$LocalLoad
+    )
+
+    $GatewayProblem = $false
+    $ExternalProblem = $false
+
+    foreach ($Row in $ProblemRows) {
+        if ($GatewayTarget -and $Row.Target -eq $GatewayTarget) {
+            $GatewayProblem = $true
+        }
+        else {
+            $ExternalProblem = $true
+        }
+    }
+
+    if ($LocalLoad.IsHigh -and $GatewayProblem) { return 'LAN/WiFi + LocalLoad/Saturation' }
+    if ($LocalLoad.IsHigh -and $ExternalProblem) { return 'Internet/ISP + LocalLoad/Saturation' }
+    if ($LocalLoad.IsHigh) { return 'LocalLoad/Saturation' }
+    if ($GatewayProblem) { return 'LAN/WiFi' }
+    if ($ExternalProblem) { return 'Internet/ISP' }
+    return 'Unknown'
+}
+
+function Get-ClassificationColor {
+    param([AllowNull()][string]$Classification)
+
+    switch -Wildcard ($Classification) {
+        '*LocalLoad*' { return 'Cyan' }
+        'LAN/WiFi*' { return 'Red' }
+        'Internet/ISP*' { return 'Yellow' }
+        default { return 'DarkGray' }
+    }
+}
+
 function Write-EventSummary {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -456,13 +494,13 @@ function Write-EventConsoleSummary {
 
     Write-Host ''
     if ($TotalEvents -eq 0) {
-        Write-Host '[VARIAZIONI] Nessun evento rilevato finora.'
+        Write-Host '[VARIAZIONI] Nessun evento rilevato finora.' -ForegroundColor DarkGray
         return
     }
 
-    Write-Host "[VARIAZIONI] Totale eventi rilevati in questa sessione: $TotalEvents"
+    Write-Host "[VARIAZIONI] Totale eventi rilevati in questa sessione: $TotalEvents" -ForegroundColor White
     foreach ($Event in $RecentEvents) {
-        Write-Host "  - $(Format-EventSnapshot -Event $Event)"
+        Write-Host "  - $(Format-EventSnapshot -Event $Event)" -ForegroundColor (Get-ClassificationColor -Classification $Event.Classification)
     }
 }
 
@@ -471,7 +509,8 @@ function Format-LiveStatus {
         [Parameter(Mandatory)][datetime]$Timestamp,
         [Parameter(Mandatory)][object[]]$Rows,
         [Parameter(Mandatory)]$LocalLoad,
-        [AllowNull()][string]$EventId
+        [AllowNull()][string]$EventId,
+        [AllowNull()][string]$Classification
     )
 
     $Parts = foreach ($Row in $Rows) {
@@ -480,7 +519,7 @@ function Format-LiveStatus {
         '{0}:{1}{2}{3}' -f $Row.Target, $LatencyText, $(if ($Row.Status -ne 'OK') { '/' + $Row.Status } else { '' }), $SpikeText
     }
 
-    $EventText = if ($EventId) { " EVENT=$EventId" } else { '' }
+    $EventText = if ($EventId) { " EVENT=$EventId [$Classification]" } else { '' }
     $LoadText = if ($LocalLoad.IsHigh) {
         ' | LOAD down={0}Mbps up={1}Mbps cpu={2}%' -f
             $(if ($null -eq $LocalLoad.DownloadMbps) { '-' } else { $LocalLoad.DownloadMbps }),
@@ -656,6 +695,7 @@ function Start-InternetMonitor {
 
             if ($ProblemRows.Count -gt 0) {
                 $ShouldStartEvent = Test-ShouldStartEvent -ProblemRows $ProblemRows -ProblemStreakByTarget $ProblemStreakByTarget -GatewayTarget $Gateway -Config $Config
+                $ProvisionalClassification = Get-ProvisionalClassification -ProblemRows $ProblemRows -GatewayTarget $Gateway -LocalLoad $LocalLoad
 
                 if ($null -eq $CurrentEvent -and $ShouldStartEvent) {
                     $EventCounter++
@@ -665,7 +705,7 @@ function Start-InternetMonitor {
                         $CurrentEvent.EventId,
                         $CurrentEvent.StartTime.ToString('yyyy-MM-dd HH:mm:ss'),
                         (($ProblemRows | Select-Object -ExpandProperty Target -Unique) -join ';')
-                    )
+                    ) -ForegroundColor (Get-ClassificationColor -Classification $ProvisionalClassification)
                 }
 
                 if ($null -ne $CurrentEvent) {
@@ -684,8 +724,9 @@ function Start-InternetMonitor {
                     Write-EventSummary -Path $EventLogPath -Headers $EventHeaders -Event $CurrentEvent
                     $ClosedEventCount++
                     Add-RecentEvent -RecentEvents $RecentEvents -Event $CurrentEvent -Limit ([int]$Config.RecentEventsShown)
+                    $ClosedSnapshot = ConvertTo-EventSnapshot -Event $CurrentEvent
                     Write-Host ''
-                    Write-Host "[VARIAZIONE] Evento chiuso: $(Format-EventSnapshot -Event (ConvertTo-EventSnapshot -Event $CurrentEvent))"
+                    Write-Host "[VARIAZIONE] Evento chiuso: $(Format-EventSnapshot -Event $ClosedSnapshot)" -ForegroundColor (Get-ClassificationColor -Classification $ClosedSnapshot.Classification)
                     Write-EventConsoleSummary -TotalEvents $ClosedEventCount -RecentEvents $RecentEvents
                     $CurrentEvent = $null
                 }
@@ -708,9 +749,15 @@ function Start-InternetMonitor {
                 }
             }
 
-            $LiveLine = Format-LiveStatus -Timestamp $LoopStart -Rows $Rows -LocalLoad $LocalLoad -EventId $(if ($CurrentEvent) { $CurrentEvent.EventId } else { $null })
+            $CurrentClassification = if ($CurrentEvent) { Get-EventClassification -Event $CurrentEvent } else { $null }
+            $LiveLine = Format-LiveStatus -Timestamp $LoopStart -Rows $Rows -LocalLoad $LocalLoad -EventId $(if ($CurrentEvent) { $CurrentEvent.EventId } else { $null }) -Classification $CurrentClassification
             try { $ConsoleWidth = [Console]::WindowWidth } catch { $ConsoleWidth = 120 }
-            Write-Host "`r$($LiveLine.PadRight($ConsoleWidth - 1))" -NoNewline
+            if ($CurrentEvent) {
+                Write-Host "`r$($LiveLine.PadRight($ConsoleWidth - 1))" -NoNewline -ForegroundColor (Get-ClassificationColor -Classification $CurrentClassification)
+            }
+            else {
+                Write-Host "`r$($LiveLine.PadRight($ConsoleWidth - 1))" -NoNewline
+            }
 
             $Elapsed = ((Get-Date) - $LoopStart).TotalMilliseconds
             $SleepMs = ([double]$Config.SampleIntervalSeconds * 1000) - $Elapsed
